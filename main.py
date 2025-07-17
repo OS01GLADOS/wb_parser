@@ -4,6 +4,14 @@ import openpyxl
 from openpyxl import Workbook
 
 
+import aiohttp
+import asyncio
+
+import json
+
+import time
+
+
 initial_address = "https://static-basket-01.wbbasket.ru/vol0/data/main-menu-by-ru-v3.json"
 
 item_list_query = "https://search.wb.ru/exactmatch/ru/common/v14/search?ab_testing=false&appType=1&curr=byn&dest=-1257786&hide_dtype=10;13;14&lang=ru&page=1&query={category_value}&resultset=catalog&sort=popular&spp=30&suppressSpellcheck=false"
@@ -12,7 +20,11 @@ ITEM_NESTING_LV = 99
 
 OUTPUT_FILE_NAME = 'wb.xlsx'
 
+REQUESTS_IN_SAME_TIME = 20
+
 item_data_all = {}
+
+semaphore = asyncio.Semaphore(REQUESTS_IN_SAME_TIME)
 
 
 def get_data_by_request(address):
@@ -21,15 +33,44 @@ def get_data_by_request(address):
     return data
 
 
-def get_items(id):
+async def a_get_data_by_request(address, retries=10, delay=1):
+    async with semaphore:
+        for attempt in range(retries):
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(address) as response:
+                        text = await response.text()
+                        return json.loads(text)
+            except (aiohttp.ClientError, asyncio.TimeoutError, aiohttp.ServerDisconnectedError) as e:
+                print(f"[Попытка {attempt+1}/{retries}] Ошибка при запросе {address}: {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    return None
+
+
+async def a_get_items(id):
     address = item_list_query.format(category_value=id)
-    items = get_data_by_request(address)
+    items = await a_get_data_by_request(address)
     return items
 
 
-def get_childs(category_id):
-    items = get_items(category_id)
+async def a_get_childs(category_id):
+    items = await a_get_items(category_id)
     return parse_items(items)
+
+
+async def a_load_childs(categories):
+
+    async def process_category(category_id, query):
+        if query is not None:
+            item_data_all[category_id] = await a_get_childs(query)
+
+            # вывод чтоб было видно что проограмма работает
+            print(f"loaded {category_id} ({query})")
+    tasks = [process_category(category_id, query) for category_id, query in categories.items()]
+    await asyncio.gather(*tasks)
 
 
 def parse_childs(children, nesting_lv=0):
@@ -61,18 +102,6 @@ def parse_items(item):
         element_to_append = {"name": name, "brand": brand, "colors": colors, "nesting_lv": nesting_lv}
         items[id] = element_to_append
     return items
-
-
-def load_childs(categories):
-    all_count = len(categories)
-    remaining_count = len(categories)
-    for category_id, query in categories.items():
-        remaining_count -=1
-        print(f"loading {category_id}(query: {query}), all {all_count}, remaining {remaining_count}")
-        if query is not None:
-
-
-            item_data_all[category_id] = get_childs(query)
 
 
 def get_categories_without_children(categories):
@@ -141,11 +170,22 @@ def save_nested_dict_to_excel(data: dict, filename: str):
 
 
 if __name__ == '__main__':
+    start_time = time.perf_counter()
+
     all_categories = get_data_by_request(initial_address)
     categories = parse_childs(all_categories)
 
     categories_without_childs = get_categories_without_children(categories)
 
-    load_childs(categories_without_childs)
+    asyncio.run(a_load_childs(categories_without_childs))
 
     save_nested_dict_to_excel(categories, OUTPUT_FILE_NAME)
+
+    end_time = time.perf_counter()
+
+    elapsed = end_time - start_time
+    print('-'*100)
+    print(f'записано в файл {OUTPUT_FILE_NAME}')
+    print('-'*100)
+
+    print(f"время выполнения: {elapsed:.2f} c.")
